@@ -1,4 +1,4 @@
-FROM espressif/idf
+FROM espressif/idf:v5.3.3
 
 ARG DEBIAN_FRONTEND=nointeractive
 
@@ -11,6 +11,9 @@ RUN apt-get update \
   libnuma1 \
   libpixman-1-0 \
   linux-tools-virtual \
+  curl \
+  && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+  && apt-get install -y nodejs \
   && rm -rf /var/lib/apt/lists/*
 
 RUN update-alternatives --install /usr/local/bin/usbip usbip `ls /usr/lib/linux-tools/*/usbip | tail -n1` 20
