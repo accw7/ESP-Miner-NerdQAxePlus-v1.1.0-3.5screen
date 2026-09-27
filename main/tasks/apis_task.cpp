@@ -54,7 +54,9 @@ void APIsFetcher::enableFetching()
 // Disable fetching - Stops the fetching process
 void APIsFetcher::disableFetching()
 {
+    pthread_mutex_lock(&m_mutex);
     m_enabled = false;
+    pthread_mutex_unlock(&m_mutex);
 }
 
 // Get latest Bitcoin price
@@ -296,17 +298,17 @@ void APIsFetcher::task() {
 
     while (true) {
         pthread_mutex_lock(&m_mutex);
-        pthread_cond_wait(&m_cond, &m_mutex); // Wait for enable signal
+        while (!m_enabled && m_bitcoinPrice != 0) {
+            pthread_cond_wait(&m_cond, &m_mutex);
+        }
         pthread_mutex_unlock(&m_mutex);
 
-        do{
-            fetchAll();
+        fetchAll();
 #if 0
-            UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
-            ESP_LOGI(TAG, "Stack high watermark: %u bytes", watermark);
+        UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
+        ESP_LOGI(TAG, "Stack high watermark: %u bytes", watermark);
 #endif
-            vTaskDelay(pdMS_TO_TICKS(60000));
-        }while (m_enabled);
+        vTaskDelay(pdMS_TO_TICKS(60000));
     }
 }
 
