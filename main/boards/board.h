@@ -305,10 +305,16 @@ public:
         return m_numTempSensors;
     }
 
-    bool isFlipScreenEnabled()
+        virtual bool isFlipScreenEnabled()
     {
         return m_flipScreen;
     }
+
+    // Board-specific LCD dimensions and timing for LVGL (override for non-standard displays)
+    virtual int getLCDWidth()         { return 320;     }  // T-Display S3 default (landscape)
+    virtual int getLCDHeight()        { return 170;     }  // T-Display S3 default
+    virtual int getLCDYGap()          { return 35;      }  // T-Display S3 default
+    virtual uint32_t getLCDPixelClockHz() { return 6528000; } // T-Display S3 default (~60 FPS)
 
     bool isInvertFanPolarityEnabled()
     {

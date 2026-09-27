@@ -10,6 +10,8 @@ SRCS
     "boards/nerdaxegamma.cpp"
     "boards/nerdqaxeplus.cpp"
     "boards/nerdqaxeplus2.cpp"
+    #include "boards/nerdqaxeplus2bigscreen.h"
+    "boards/nerdqaxeplus2bigscreen.cpp"
     "boards/nerdoctaxeplus.cpp"
     "boards/nerdoctaxegamma.cpp"
     "boards/nerdhaxegamma.cpp"

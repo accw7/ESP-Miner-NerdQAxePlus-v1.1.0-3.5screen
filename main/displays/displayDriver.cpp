@@ -24,7 +24,14 @@
 
 #include "nvs_config.h"
 #include "displayDriver.h"
-
+// ---------- pixel-scaler state ----------
+static lv_color_t *s_scale_buf    = nullptr;
+static int         s_scale_buf_px = 0;
+static int         s_src_w        = 320;
+static int         s_src_h        = 170;
+static int         s_dst_w        = 320;
+static int         s_dst_y_off    = 0;
+static bool        s_scale_active = false;
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 
 static const char *TAG = "TDisplayS3";
@@ -95,12 +102,47 @@ bool DisplayDriver::notifyLvglFlushReady(esp_lcd_panel_io_handle_t panelIo, esp_
 
 void DisplayDriver::lvglFlushCallback(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t* colorMap) {
     esp_lcd_panel_handle_t panelHandle = (esp_lcd_panel_handle_t)drv->user_data;
-    int offsetx1 = area->x1;
-    int offsetx2 = area->x2;
-    int offsety1 = area->y1;
-    int offsety2 = area->y2;
-    // Copy buffer content to the display
-    esp_lcd_panel_draw_bitmap(panelHandle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, colorMap);
+
+    if (!s_scale_active) {
+        esp_lcd_panel_draw_bitmap(panelHandle, area->x1, area->y1, area->x2 + 1, area->y2 + 1, colorMap);
+        return;
+    }
+
+    const int src_x1 = area->x1, src_x2 = area->x2;
+    const int src_y1 = area->y1, src_y2 = area->y2;
+    const int src_w  = src_x2 - src_x1 + 1;
+    const int src_h  = src_y2 - src_y1 + 1;
+
+    const int dst_x1 =  src_x1      * s_dst_w / s_src_w;
+    const int dst_x2 = (src_x2 + 1) * s_dst_w / s_src_w - 1;
+    const int dst_y1 =  src_y1      * s_dst_w / s_src_w + s_dst_y_off;
+    const int dst_y2 = (src_y2 + 1) * s_dst_w / s_src_w - 1 + s_dst_y_off;
+    const int out_w  = dst_x2 - dst_x1 + 1;
+    const int out_h  = dst_y2 - dst_y1 + 1;
+
+    if (out_w <= 0 || out_h <= 0 || out_w * out_h > s_scale_buf_px) {
+        ESP_LOGE("scale", "scaler overflow: out=%dx%d buf=%d", out_w, out_h, s_scale_buf_px);
+        esp_lcd_panel_draw_bitmap(panelHandle, area->x1, area->y1, area->x2 + 1, area->y2 + 1, colorMap);
+        return;
+    }
+
+    static int sx_lut[480];
+    for (int dx = 0; dx < out_w; dx++) {
+        int sx = dx * src_w / out_w;
+        sx_lut[dx] = (sx < src_w) ? sx : src_w - 1;
+    }
+
+    lv_color_t *out = s_scale_buf;
+    for (int dy = 0; dy < out_h; dy++) {
+        int sy = dy * src_h / out_h;
+        if (sy >= src_h) sy = src_h - 1;
+        const lv_color_t *src_row = colorMap + (size_t)sy * src_w;
+        for (int dx = 0; dx < out_w; dx++) {
+            *out++ = src_row[sx_lut[dx]];
+        }
+    }
+
+    esp_lcd_panel_draw_bitmap(panelHandle, dst_x1, dst_y1, dst_x2 + 1, dst_y2 + 1, s_scale_buf);
 }
 
 /************ DISPLAY TURN ON/OFF FUNCTIONS *************/
@@ -656,36 +698,26 @@ void DisplayDriver::lvglTimerTask(void *param)
         uint32_t wait_ms = handleLvglTick(elapsed_Ani_cycles);
 
         if (POWER_MANAGEMENT_MODULE.isShutdown()) {
-            // switch into poweroff state
             enterState(UiState::PowerOff, tnow);
             vTaskDelay(pdMS_TO_TICKS(wait_ms));
             continue;
         }
 
-        // --- Handle buttons ---
         bool btn1Press = false, btn2Press = false, btnBothLongPress = false;
         processButtons(btn1, btn2, tnow, btn1Press, btn2Press, btnBothLongPress);
 
-        // animation is running, ignore buttons
         if (m_screenAnimationRunning) {
             btn1Press = false;
             btn2Press = false;
             btnBothLongPress = false;
         }
 
-        // --- Handle queued UI messages ---
         handleUiQueueMessages(msg, tnow);
-
-        // --- Handle auto turn-off and overlays ---
         handleAutoOffAndOverlays();
-
-        // --- Update FSM state ---
         updateState(tnow, btn1Press, btn2Press, btnBothLongPress);
     }
 }
 
-
-// Función para activar las actualizaciones
 void DisplayDriver::enableLvglAnimations(bool enable)
 {
     m_animationsEnabled = enable;
@@ -693,14 +725,31 @@ void DisplayDriver::enableLvglAnimations(bool enable)
 
 void DisplayDriver::mainCreatSysteTasks(void)
 {
-    xTaskCreatePinnedToCore(lvglTimerTaskWrapper, "lvgl Timer", 6000, (void*) this, 4, NULL, 1); // Antes 10000
+    xTaskCreatePinnedToCore(lvglTimerTaskWrapper, "lvgl Timer", 6000, (void*) this, 4, NULL, 1);
 }
 
 lv_obj_t *DisplayDriver::initTDisplayS3(void)
 {
-    static lv_disp_draw_buf_t disp_buf; // contains internal graphic buffer(s) called draw buffer(s)
-    static lv_disp_drv_t disp_drv;      // contains callback functions
-    // GPIO configuration
+    static lv_disp_draw_buf_t disp_buf;
+    static lv_disp_drv_t disp_drv;
+
+    Board *board = SYSTEM_MODULE.getBoard();
+    int lcd_width        = board->getLCDWidth();
+    int lcd_height       = board->getLCDHeight();
+    uint32_t lcd_pclk_hz = board->getLCDPixelClockHz();
+
+    static const int lvgl_w = 320;
+    static const int lvgl_h = 170;
+    int lvgl_buf_pixels = (lvgl_w * lvgl_h) / 6;
+
+    float sf = (float)lcd_width / (float)lvgl_w;
+    int bus_max_pixels = (int)(lvgl_buf_pixels * sf * sf * 1.25f) + 512;
+    size_t bus_max_bytes = ((size_t)(bus_max_pixels * sizeof(uint16_t)) + 63) & ~63UL;
+
+    ESP_LOGI(TAG, "LCD %dx%d pclk=%lu  LVGL %dx%d  buf=%d  bus_max=%u",
+             lcd_width, lcd_height, (unsigned long)lcd_pclk_hz,
+             lvgl_w, lvgl_h, lvgl_buf_pixels, (unsigned)bus_max_bytes);
+
     ESP_LOGI(TAG, "Turn off LCD backlight");
     gpio_config_t bk_gpio_config = {.pin_bit_mask = 1ULL << TDISPLAYS3_PIN_NUM_BK_LIGHT, .mode = GPIO_MODE_OUTPUT};
     ESP_ERROR_CHECK(gpio_config(&bk_gpio_config));
@@ -708,9 +757,6 @@ lv_obj_t *DisplayDriver::initTDisplayS3(void)
     gpio_pad_select_gpio(TDISPLAYS3_PIN_NUM_BK_LIGHT);
     gpio_pad_select_gpio(TDISPLAYS3_PIN_RD);
     gpio_pad_select_gpio(TDISPLAYS3_PIN_PWR);
-    // esp_rom_gpio_pad_select_gpio(TDISPLAYS3_PIN_NUM_BK_LIGHT);
-    // esp_rom_gpio_pad_select_gpio(TDISPLAYS3_PIN_RD);
-    // esp_rom_gpio_pad_select_gpio(TDISPLAYS3_PIN_PWR);
 
     gpio_set_direction(TDISPLAYS3_PIN_NUM_BK_LIGHT, GPIO_MODE_OUTPUT);
     gpio_set_direction(TDISPLAYS3_PIN_RD, GPIO_MODE_OUTPUT);
@@ -736,14 +782,14 @@ lv_obj_t *DisplayDriver::initTDisplayS3(void)
                                                    TDISPLAYS3_PIN_NUM_DATA7,
                                                },
                                            .bus_width = 8,
-                                           .max_transfer_bytes = LVGL_LCD_BUF_SIZE * sizeof(uint16_t),
+                                           .max_transfer_bytes = bus_max_bytes,
                                            .psram_trans_align = LCD_PSRAM_TRANS_ALIGN,
                                            .sram_trans_align = LCD_SRAM_TRANS_ALIGN};
     ESP_ERROR_CHECK(esp_lcd_new_i80_bus(&bus_config, &i80_bus));
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_i80_config_t io_config = {
         .cs_gpio_num = TDISPLAYS3_PIN_NUM_CS,
-        .pclk_hz = TDISPLAYS3_LCD_PIXEL_CLOCK_HZ,
+        .pclk_hz = lcd_pclk_hz,
         .trans_queue_depth = 20,
         .on_color_trans_done = notifyLvglFlushReady,
         .user_ctx = &disp_drv,
@@ -776,15 +822,13 @@ lv_obj_t *DisplayDriver::initTDisplayS3(void)
 
     esp_lcd_panel_swap_xy(panel_handle, true);
 
-    Board *board = SYSTEM_MODULE.getBoard();
     if (!board->isFlipScreenEnabled()) {
         esp_lcd_panel_mirror(panel_handle, true, false);
     } else {
-        esp_lcd_panel_mirror(panel_handle, false, true);
+        esp_lcd_panel_mirror(panel_handle, false, false);
     }
 
-    // the gap is LCD panel specific, even panels with the same driver IC, can have different gap value
-    esp_lcd_panel_set_gap(panel_handle, 0, 35);
+    esp_lcd_panel_set_gap(panel_handle, 0, board->getLCDYGap());
 
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
@@ -794,33 +838,54 @@ lv_obj_t *DisplayDriver::initTDisplayS3(void)
 
     ESP_LOGI(TAG, "Initialize LVGL library");
     lv_init();
-    // alloc draw buffers used by LVGL
-    // it's recommended to choose the size of the draw buffer(s) to be at least 1/10 screen sized
-    lv_color_t *buf1 = (lv_color_t*) MALLOC_DMA(LVGL_LCD_BUF_SIZE * sizeof(lv_color_t));
+    lv_color_t *buf1 = (lv_color_t*) MALLOC_DMA(lvgl_buf_pixels * sizeof(lv_color_t));
     assert(buf1);
-    // initialize LVGL draw buffers
-    lv_disp_draw_buf_init(&disp_buf, buf1, NULL, LVGL_LCD_BUF_SIZE);
+    lv_disp_draw_buf_init(&disp_buf, buf1, NULL, lvgl_buf_pixels);
 
     ESP_LOGI(TAG, "Register display driver to LVGL");
     lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = TDISPLAYS3_LCD_H_RES;
-    disp_drv.ver_res = TDISPLAYS3_LCD_V_RES;
+    disp_drv.hor_res = lvgl_w;
+    disp_drv.ver_res = lvgl_h;
     disp_drv.flush_cb = lvglFlushCallback;
     disp_drv.draw_buf = &disp_buf;
     disp_drv.user_data = panel_handle;
     lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
 
-    // Configuration is completed.
+    s_src_w = lvgl_w;
+    s_src_h = lvgl_h;
+    s_dst_w = lcd_width;
+    {
+        int dst_h_scaled = lvgl_h * lcd_width / lvgl_w;
+        s_dst_y_off      = (lcd_height - dst_h_scaled) / 2;
+    }
+    s_scale_active = (lcd_width != lvgl_w);
+
+    if (s_scale_active) {
+        s_scale_buf_px = bus_max_pixels;
+        s_scale_buf    = (lv_color_t*) MALLOC_DMA(s_scale_buf_px * sizeof(lv_color_t));
+        assert(s_scale_buf);
+        ESP_LOGI(TAG, "Pixel scaler: %dx%d -> %dx%d, y_off=%d, buf_px=%d",
+                 lvgl_w, lvgl_h, lcd_width, lvgl_h * lcd_width / lvgl_w,
+                 s_dst_y_off, s_scale_buf_px);
+
+        const int chunk_rows  = 16;
+        const size_t chunk_sz = (size_t)(chunk_rows * lcd_width) * sizeof(lv_color_t);
+        lv_color_t *fill_buf  = (lv_color_t*) heap_caps_malloc(chunk_sz, MALLOC_CAP_DMA);
+        if (fill_buf) {
+            memset(fill_buf, 0, chunk_sz);
+            for (int y = 0; y < lcd_height; y += chunk_rows) {
+                int end_y = (y + chunk_rows <= lcd_height) ? y + chunk_rows : lcd_height;
+                esp_lcd_panel_draw_bitmap(panel_handle, 0, y, lcd_width, end_y, fill_buf);
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            free(fill_buf);
+            ESP_LOGI(TAG, "LCD %dx%d black-filled", lcd_width, lcd_height);
+        }
+    }
 
     ESP_LOGI(TAG, "Install LVGL tick timer");
-    // Tick interface for LVGL (using esp_timer to generate 2ms periodic event)
-    /*const esp_timer_create_args_t lvgl_tick_timer_args = {
-        .callback = &example_increaseLvglTick,
-        .name = "lvgl_tick"
-    };*/
     esp_timer_handle_t lvgl_tick_timer = NULL;
-    // ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
-    // ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer, TDISPLAYS3_LVGL_TICK_PERIOD_MS * 1000));
 
     ESP_LOGI(TAG, "Display LVGL animation");
     lv_obj_t *scr = lv_disp_get_scr_act(disp);
