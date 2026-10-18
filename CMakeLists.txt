@@ -40,6 +40,6 @@ include_directories("./components/arduinojson")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
+file(STRINGS "${CMAKE_SOURCE_DIR}/VERSION" PROJECT_VER LIMIT_COUNT 1)
 
 project(esp-miner)
-
